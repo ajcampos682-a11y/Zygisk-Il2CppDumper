@@ -1,13 +1,19 @@
 //
 // Created by Perfare on 2020/7/4.
+// Patched: dump the DECRYPTED global-metadata.dat straight out of process memory,
+// without calling any il2cpp_* export (this game strips/renames them). Il2CppDumper
+// can then be run statically on the dumped metadata + libil2cpp.so.
 //
 
 #include "hack.h"
-#include "il2cpp_dump.h"
 #include "log.h"
 #include "xdl.h"
 #include <cstring>
 #include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <cinttypes>
+#include <string>
 #include <unistd.h>
 #include <sys/system_properties.h>
 #include <dlfcn.h>
@@ -17,22 +23,89 @@
 #include <linux/unistd.h>
 #include <array>
 
-void hack_start(const char *game_data_dir) {
-    bool load = false;
-    for (int i = 0; i < 10; i++) {
-        void *handle = xdl_open("libil2cpp.so", 0);
-        if (handle) {
-            load = true;
-            il2cpp_api_init(handle);
-            il2cpp_dump(game_data_dir);
-            break;
-        } else {
-            sleep(1);
+// Il2Cpp global-metadata header magic, little-endian on disk/in memory.
+static const uint32_t METADATA_MAGIC = 0xFAB11BAF;
+
+// Scan one readable region for the decrypted metadata header; write it if found.
+static bool scan_region(uint64_t start, uint64_t end, const std::string &outPath) {
+    uint64_t size = end - start;
+    if (size < 0x1000 || size > 0x20000000ULL) return false; // skip tiny / >512MB
+    auto *base = reinterpret_cast<uint8_t *>(start);
+    for (uint64_t off = 0; off + 0x120 < size; off += 4) {
+        auto *p = reinterpret_cast<uint32_t *>(base + off);
+        if (*p != METADATA_MAGIC) continue;
+        int32_t version = *reinterpret_cast<int32_t *>(base + off + 4);
+        if (version < 16 || version > 40) continue; // plausible il2cpp metadata version
+
+        // Header is (magic, version) then int32 (offset,size) pairs. Real file size
+        // is the furthest (offset+size). Read pairs within the first 0x120 bytes.
+        auto *hdr = reinterpret_cast<uint32_t *>(base + off);
+        uint64_t total = 0x110;
+        for (int i = 2; i + 1 < (0x120 / 4); i += 2) {
+            uint64_t o = hdr[i];
+            uint64_t s = hdr[i + 1];
+            if (o < size && s < size && o + s <= size && (o + s) > total) total = o + s;
         }
+        if (total < 0x100000 || total > 0x4000000) continue;      // 1MB..64MB sane range
+        if (off + total > size) continue;
+
+        LOGI("decrypted metadata at %p version=%d size=%" PRIu64, base + off, version, total);
+        FILE *out = fopen(outPath.c_str(), "wb");
+        if (!out) { LOGE("cannot open %s", outPath.c_str()); return false; }
+        size_t wrote = fwrite(base + off, 1, (size_t) total, out);
+        fclose(out);
+        LOGI("wrote %zu bytes to %s", wrote, outPath.c_str());
+        return wrote == total;
     }
-    if (!load) {
-        LOGI("libil2cpp.so not found in thread %d", gettid());
+    return false;
+}
+
+// Walk /proc/self/maps and scan each readable, non-device region.
+static bool dump_metadata(const char *game_data_dir) {
+    std::string outPath = std::string(game_data_dir) + "/files/global-metadata-decrypted.dat";
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) { LOGE("cannot open /proc/self/maps"); return false; }
+    char line[1024];
+    bool found = false;
+    while (fgets(line, sizeof(line), maps)) {
+        uint64_t start = 0, end = 0;
+        char perms[8] = {0};
+        char path[768] = {0};
+        int n = sscanf(line, "%" SCNx64 "-%" SCNx64 " %7s %*x %*x:%*x %*u %767[^\n]",
+                       &start, &end, perms, path);
+        if (n < 3) continue;
+        if (perms[0] != 'r') continue;               // must be readable
+        if (strstr(path, "/dev/")) continue;         // skip device maps (can fault)
+        if (path[0] == '[' && strncmp(path, "[anon", 5) != 0) continue; // skip [vvar]/[vdso]/etc
+        if (scan_region(start, end, outPath)) { found = true; break; }
     }
+    fclose(maps);
+    return found;
+}
+
+void hack_start(const char *game_data_dir) {
+    // Wait until libil2cpp.so is actually loaded into the process.
+    bool loaded = false;
+    for (int i = 0; i < 60; i++) {
+        void *handle = xdl_open("libil2cpp.so", 0);
+        if (handle) { loaded = true; break; }
+        sleep(1);
+    }
+    if (!loaded) {
+        LOGE("libil2cpp.so not found in thread %d", gettid());
+        return;
+    }
+    LOGI("libil2cpp.so present, scanning memory for decrypted metadata...");
+
+    // Metadata is decrypted in RAM shortly after il2cpp_init starts; poll for it.
+    for (int i = 0; i < 90; i++) {
+        if (dump_metadata(game_data_dir)) {
+            LOGI("metadata dump complete");
+            return;
+        }
+        sleep(1);
+    }
+    LOGE("decrypted metadata magic not found after scanning");
 }
 
 std::string GetLibDir(JavaVM *vms) {
