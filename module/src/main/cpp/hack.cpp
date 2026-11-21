@@ -1,8 +1,8 @@
 //
 // Created by Perfare on 2020/7/4.
-// Patched: dump the DECRYPTED global-metadata.dat straight out of process memory,
-// without calling any il2cpp_* export (this game strips/renames them). Il2CppDumper
-// can then be run statically on the dumped metadata + libil2cpp.so.
+// Patched v2: dump the DECRYPTED global-metadata.dat from process memory, reading
+// through /proc/self/mem with pread so a bad page returns an error instead of
+// faulting the process. No il2cpp_* exports are called (this game strips them).
 //
 
 #include "hack.h"
@@ -14,7 +14,10 @@
 #include <cstdlib>
 #include <cinttypes>
 #include <string>
+#include <vector>
+#include <algorithm>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/system_properties.h>
 #include <dlfcn.h>
 #include <jni.h>
@@ -23,48 +26,77 @@
 #include <linux/unistd.h>
 #include <array>
 
-// Il2Cpp global-metadata header magic, little-endian on disk/in memory.
 static const uint32_t METADATA_MAGIC = 0xFAB11BAF;
+static const uint64_t MAX_META = 0x4000000ULL; // 64MB ceiling for a sane metadata blob
 
-// Scan one readable region for the decrypted metadata header; write it if found.
-static bool scan_region(uint64_t start, uint64_t end, const std::string &outPath) {
+// Read up to len bytes at virtual address addr via /proc/self/mem. Never faults.
+static ssize_t safe_read(int fd, uint64_t addr, void *out, size_t len) {
+    return pread(fd, out, len, (off_t) addr);
+}
+
+// Given a candidate header already in buf, compute the real metadata size.
+static uint64_t compute_total(const uint8_t *hdr) {
+    uint64_t total = 0x110;
+    for (int i = 2; i + 1 < (0x120 / 4); i += 2) {
+        uint32_t o, s;
+        memcpy(&o, hdr + i * 4, 4);
+        memcpy(&s, hdr + i * 4 + 4, 4);
+        if (o < MAX_META && s < MAX_META && (uint64_t) o + s > total && (uint64_t) o + s < MAX_META)
+            total = (uint64_t) o + s;
+    }
+    return total;
+}
+
+static bool write_metadata(int fd, uint64_t src, uint64_t total, const std::string &outPath) {
+    FILE *out = fopen(outPath.c_str(), "wb");
+    if (!out) { LOGE("cannot open %s", outPath.c_str()); return false; }
+    std::vector<uint8_t> big(0x100000);
+    uint64_t remaining = total, cur = src;
+    while (remaining > 0) {
+        size_t want = (size_t) std::min<uint64_t>(big.size(), remaining);
+        ssize_t r = safe_read(fd, cur, big.data(), want);
+        if (r <= 0) { fclose(out); LOGE("read failed at %" PRIx64, cur); return false; }
+        fwrite(big.data(), 1, (size_t) r, out);
+        remaining -= (uint64_t) r;
+        cur += (uint64_t) r;
+    }
+    fclose(out);
+    LOGI("wrote %" PRIu64 " bytes to %s", total, outPath.c_str());
+    return true;
+}
+
+static bool scan_region(int fd, uint64_t start, uint64_t end, const std::string &outPath) {
     uint64_t size = end - start;
     if (size < 0x1000 || size > 0x20000000ULL) return false; // skip tiny / >512MB
-    auto *base = reinterpret_cast<uint8_t *>(start);
-    for (uint64_t off = 0; off + 0x120 < size; off += 4) {
-        auto *p = reinterpret_cast<uint32_t *>(base + off);
-        if (*p != METADATA_MAGIC) continue;
-        int32_t version = *reinterpret_cast<int32_t *>(base + off + 4);
-        if (version < 16 || version > 40) continue; // plausible il2cpp metadata version
-
-        // Header is (magic, version) then int32 (offset,size) pairs. Real file size
-        // is the furthest (offset+size). Read pairs within the first 0x120 bytes.
-        auto *hdr = reinterpret_cast<uint32_t *>(base + off);
-        uint64_t total = 0x110;
-        for (int i = 2; i + 1 < (0x120 / 4); i += 2) {
-            uint64_t o = hdr[i];
-            uint64_t s = hdr[i + 1];
-            if (o < size && s < size && o + s <= size && (o + s) > total) total = o + s;
+    const size_t CHUNK = 0x100000;                           // 1MB window
+    std::vector<uint8_t> buf(CHUNK + 0x120);
+    for (uint64_t base = start; base < end; base += CHUNK) {
+        size_t want = (size_t) std::min<uint64_t>(buf.size(), end - base);
+        ssize_t got = safe_read(fd, base, buf.data(), want);
+        if (got <= 0x120) continue;                          // unreadable chunk -> skip
+        for (ssize_t off = 0; off + 0x120 < got; off += 4) {
+            uint32_t magic;
+            memcpy(&magic, buf.data() + off, 4);
+            if (magic != METADATA_MAGIC) continue;
+            int32_t version;
+            memcpy(&version, buf.data() + off + 4, 4);
+            if (version < 16 || version > 40) continue;
+            uint64_t total = compute_total(buf.data() + off);
+            if (total < 0x100000 || total > MAX_META) continue;
+            LOGI("decrypted metadata at %" PRIx64 " version=%d size=%" PRIu64,
+                 base + (uint64_t) off, version, total);
+            if (write_metadata(fd, base + (uint64_t) off, total, outPath)) return true;
         }
-        if (total < 0x100000 || total > 0x4000000) continue;      // 1MB..64MB sane range
-        if (off + total > size) continue;
-
-        LOGI("decrypted metadata at %p version=%d size=%" PRIu64, base + off, version, total);
-        FILE *out = fopen(outPath.c_str(), "wb");
-        if (!out) { LOGE("cannot open %s", outPath.c_str()); return false; }
-        size_t wrote = fwrite(base + off, 1, (size_t) total, out);
-        fclose(out);
-        LOGI("wrote %zu bytes to %s", wrote, outPath.c_str());
-        return wrote == total;
     }
     return false;
 }
 
-// Walk /proc/self/maps and scan each readable, non-device region.
 static bool dump_metadata(const char *game_data_dir) {
     std::string outPath = std::string(game_data_dir) + "/files/global-metadata-decrypted.dat";
+    int fd = open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { LOGE("cannot open /proc/self/mem"); return false; }
     FILE *maps = fopen("/proc/self/maps", "r");
-    if (!maps) { LOGE("cannot open /proc/self/maps"); return false; }
+    if (!maps) { LOGE("cannot open /proc/self/maps"); close(fd); return false; }
     char line[1024];
     bool found = false;
     while (fgets(line, sizeof(line), maps)) {
@@ -74,17 +106,17 @@ static bool dump_metadata(const char *game_data_dir) {
         int n = sscanf(line, "%" SCNx64 "-%" SCNx64 " %7s %*x %*x:%*x %*u %767[^\n]",
                        &start, &end, perms, path);
         if (n < 3) continue;
-        if (perms[0] != 'r') continue;               // must be readable
-        if (strstr(path, "/dev/")) continue;         // skip device maps (can fault)
-        if (path[0] == '[' && strncmp(path, "[anon", 5) != 0) continue; // skip [vvar]/[vdso]/etc
-        if (scan_region(start, end, outPath)) { found = true; break; }
+        if (perms[0] != 'r') continue;
+        if (strstr(path, "/dev/")) continue;
+        if (path[0] == '[' && strncmp(path, "[anon", 5) != 0) continue;
+        if (scan_region(fd, start, end, outPath)) { found = true; break; }
     }
     fclose(maps);
+    close(fd);
     return found;
 }
 
 void hack_start(const char *game_data_dir) {
-    // Wait until libil2cpp.so is actually loaded into the process.
     bool loaded = false;
     for (int i = 0; i < 60; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
@@ -96,8 +128,6 @@ void hack_start(const char *game_data_dir) {
         return;
     }
     LOGI("libil2cpp.so present, scanning memory for decrypted metadata...");
-
-    // Metadata is decrypted in RAM shortly after il2cpp_init starts; poll for it.
     for (int i = 0; i < 90; i++) {
         if (dump_metadata(game_data_dir)) {
             LOGI("metadata dump complete");
@@ -185,7 +215,6 @@ struct NativeBridgeCallbacks {
 };
 
 bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
-    //TODO 等待houdini初始化
     sleep(5);
 
     auto libart = dlopen("libart.so", RTLD_NOW);
